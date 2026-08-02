@@ -3,13 +3,13 @@ import requests
 import yfinance as yf
 import pandas as pd
 
-# 텔레그램 설정 (환경변수 또는 직접 입력)
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8832709732:AAEhrq3lVI1nVwp5uLwV0uE_Zegrd9pTAwA")
+# 깃허브 시크릿 이름('TELEGRAM_TOKEN')과 정확히 일치시킵니다
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_TOKEN", "8832709732:AAEhrq3lVI1nVwp5uLwV0uE_Zegrd9pTAwA")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "5763039504")
 
 def send_telegram_message(message):
     """텔레그램으로 메시지를 전송하는 함수"""
-    if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "8832709732:AAEhrq3lVI1nVwp5uLwV0uE_Zegrd9pTAwA":
+    if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "로컬테스트용토큰":
         print("⚠️ 텔레그램 토큰이 설정되지 않았습니다.")
         return
     
