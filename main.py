@@ -1,13 +1,40 @@
+import os
+import requests
 import yfinance as yf
 import pandas as pd
 
+# 텔레그램 설정 (환경변수 또는 직접 입력)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8832709732:AAEhrq3lVI1nVwp5uLwV0uE_Zegrd9pTAwA")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "5763039504")
+
+def send_telegram_message(message):
+    """텔레그램으로 메시지를 전송하는 함수"""
+    if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "8832709732:AAEhrq3lVI1nVwp5uLwV0uE_Zegrd9pTAwA":
+        print("⚠️ 텔레그램 토큰이 설정되지 않았습니다.")
+        return
+    
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown"
+    }
+    try:
+        response = requests.post(url, json=payload)
+        if response.status_code == 200:
+            print("📲 텔레그램 알림 전송 성공!")
+        else:
+            print(f"❌ 텔레그램 전송 실패: {response.text}")
+    except Exception as e:
+        print(f"❌ 텔레그램 에러 발생: {e}")
+
 def check_trading_signal():
-    # 1. 최신 데이터 수집 (QQQ, QLD)
+    # 1. 최신 데이터 수집 (QQQ)
     qqq_raw = yf.download("QQQ", period="1y", interval="1d", progress=False)
     
     if qqq_raw.empty:
         print("데이터 수집 실패")
-        return None
+        return
 
     # 데이터프레임 정리 (멀티인덱스 대응)
     qqq_df = pd.DataFrame()
@@ -26,32 +53,30 @@ def check_trading_signal():
     # 3. 기본 추세 판정 (상승장 여부)
     is_bull_trend = ma5 >= ma200
 
-    # 4. [신규 추가] 이격도 과열 필터 로직
-    # 예: 200일선 대비 주가가 15% 이상 폭등해 있으면 '과열(True)'로 판정
-    disparity_limit = 1.15  # 1.15 = +15% 과열 기준
+    # 4. 이격도 과열 필터 로직 (+15% 이상 과열 판정)
+    disparity_limit = 1.15  
     current_disparity = curr_close / ma200
     is_overheated = current_disparity > disparity_limit
 
-    print(f"📊 [시장 상태 진단]")
-    print(f" - QQQ 종가: ${curr_close:.2f}")
-    print(f" - 5일선: ${ma5:.2f} / 200일선: ${ma200:.2f}")
-    print(f" - 이격도(대 200일선): {(current_disparity - 1) * 100:+.2f}%")
+    # 5. 메시지 본문 구성
+    msg = f"📈 **QLD 자동매매 봇 리포트**\n\n"
+    msg += f"• QQQ 종가: `${curr_close:.2f}`\n"
+    msg += f"• 5일선: `${ma5:.2f}`\n"
+    msg += f"• 200일선: `${ma200:.2f}`\n"
+    msg += f"• 이격도: `{(current_disparity - 1) * 100:+.2f}%`\n\n"
 
-    # 5. 최종 매매 신호 결정
     if not is_bull_trend:
-        signal = "SELL"
-        reason = "🔴 하락장 전환 (데드크로스) - 현금 대피"
+        msg += "🔴 **[매도 / 현금 대피]**\n하락장 전환 (데드크로스 발생)"
     else:
-        # 상승장(초록불)이지만 과열 필터에 걸린 경우
         if is_overheated:
-            signal = "HOLD_OR_WAIT"
-            reason = f"⚠️ 상승장이지만 이격도 과열({(current_disparity - 1) * 100:.1f}%)로 신규 진입 보류"
+            msg += f"⚠️ **[관망 / 진입 보류]**\n상승장이지만 이격도 과열({(current_disparity - 1) * 100:.1f}%) 상태입니다."
         else:
-            signal = "BUY"
-            reason = "🟢 상승장 정상 궤도 - 매수/보유 진입"
+            msg += "🟢 **[매수 / 보유 유효]**\n정상 상승장 궤도 진입 완료!"
 
-    print(f" - 최종 판정: [{signal}] ({reason})\n")
-    return signal
+    print(msg)
+    
+    # 6. 텔레그램으로 최종 메시지 쏘기
+    send_telegram_message(msg)
 
 if __name__ == "__main__":
     check_trading_signal()
