@@ -1,221 +1,183 @@
-import json
 import os
-import sys
-import pandas as pd
+import json
 import requests
+import datetime
 import yfinance as yf
+import pandas as pd
 
-# ==========================================
-# 1. 설정 및 상태 파일
-# ==========================================
-STATE_FILE = "state.json"
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+STATE_FILE = "strategy_state.json"
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-def load_state():
-    default_state = {
-        "position_state": "HOLDING",  # 현재 보유 상태 (초기 세팅값)
-        "overheated_flag": False,
-        "last_processed_date": ""
-    }
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            print(f"상태 로드 실패 (기본값 사용): {e}")
-            return default_state
-    return default_state
-
-def save_state(state):
-    try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=4, ensure_ascii=False)
-    except Exception as e:
-        print(f"상태 저장 실패: {e}")
-
-def send_telegram(message):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️ 텔레그램 환경변수 미설정 (콘솔 출력):")
-        print(message)
+def send_telegram(message: str):
+    if not BOT_TOKEN or not CHAT_ID:
+        print("[Warning] Telegram 토큰 또는 Chat ID가 설정되지 않았습니다.")
         return
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": CHAT_ID,
         "text": message,
-        "parse_mode": "HTML"
+        "parse_mode": "Markdown"
     }
-    try:
-        res = requests.post(url, json=payload, timeout=10)
-        if res.status_code == 200:
-            print("📲 텔레그램 알림 전송 완료")
-        else:
-            print(f"❌ 텔레그램 전송 실패: {res.text}")
-    except Exception as e:
-        print(f"❌ 텔레그램 전송 에러: {e}")
+    requests.post(url, json=payload, timeout=10)
 
-# ==========================================
-# 2. 데이터 수집 및 Dual-Regime 지표 계산
-# ==========================================
-def get_market_data():
-    tickers = ["QQQ", "QLD", "TQQQ"]
-    data = yf.download(tickers, period="2y", interval="1d", progress=False)
-
-    if data.empty:
-        raise ValueError("데이터 다운로드에 실패했습니다.")
-
-    if isinstance(data.columns, pd.MultiIndex):
-        c_df = data["Close"]
-        h_df = data["High"]
-        l_df = data["Low"]
-    else:
-        c_df = data
-        h_df = data
-        l_df = data
-
-    qqq_c = c_df["QQQ"]
-    qqq_h = h_df["QQQ"]
-    qqq_l = l_df["QQQ"]
-
-    # 1. 거시 추세선 (2022년형 하락장 차단)
-    ma5 = qqq_c.rolling(window=5).mean()
-    ma20 = qqq_c.rolling(window=20).mean()
-    ma200 = qqq_c.rolling(window=200).mean()
-    disparity = qqq_c / ma200
-
-    # 2. SMC Equilibrium (최근 20일 스윙 중심값)
-    swing_high = qqq_h.rolling(window=20).max()
-    swing_low = qqq_l.rolling(window=20).min()
-    equilibrium = (swing_high + swing_low) / 2
-
-    # 3. ChrisMoody MACD Histogram
-    ema12 = qqq_c.ewm(span=12, adjust=False).mean()
-    ema26 = qqq_c.ewm(span=26, adjust=False).mean()
-    macd = ema12 - ema26
-    signal = macd.rolling(window=9).mean()
-    macd_hist = macd - signal
-
-    latest_date = qqq_c.index[-1].strftime("%Y-%m-%d")
-
+def load_state() -> dict:
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
     return {
-        "date": latest_date,
-        "qqq_close": float(qqq_c.iloc[-1]),
-        "qld_close": float(c_df["QLD"].iloc[-1]),
-        "tqqq_close": float(c_df["TQQQ"].iloc[-1]),
-        "ma5": float(ma5.iloc[-1]),
-        "ma20": float(ma20.iloc[-1]),
-        "ma200": float(ma200.iloc[-1]),
-        "disparity": float(disparity.iloc[-1]),
-        "equilibrium": float(equilibrium.iloc[-1]),
-        "macd_hist": float(macd_hist.iloc[-1]),
+        "position": "CASH",           # "CASH" 또는 "HOLDING"
+        "entry_date": None,
+        "entry_price": 0.0,
+        "cooldown_counter": 0,
+        "overheated": False
     }
 
-# ==========================================
-# 3. Dual-Regime SMC Apex 매매 판정 엔진
-# ==========================================
-def evaluate_strategy(data, state):
-    pos = state.get("position_state", "HOLDING")
-    overheated = state.get("overheated_flag", False)
+def save_state(state: dict):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=4, ensure_ascii=False)
 
-    close = data["qqq_close"]
-    ma5 = data["ma5"]
-    ma20 = data["ma20"]
-    ma200 = data["ma200"]
-    disp = data["disparity"]
-    eq = data["equilibrium"]
-    macd_hist = data["macd_hist"]
-
-    is_bull = ma5 >= ma200
-    above_ma20 = close > ma20
-    macd_bull = macd_hist > 0
-
-    action_title = ""
-    action_desc = ""
-
-    # [1] 거시 하락장 (MA5 < MA200)
-    if not is_bull:
-        if pos == "HOLDING":
-            action_title = "🔴 [대세 하락 탈출 매도]"
-            action_desc = "MA5 < MA200 데드크로스가 발생했습니다.\n👉 <b>전량 매도 후 현금 100% 확보</b>"
-        else:
-            action_title = "⚪ [하락장 관망 유지]"
-            action_desc = "MA5 < MA200 역배열 지속 중입니다.\n👉 <b>현금 100% 관망 유지</b>"
-        pos = "CASH_AFTER_BEAR"
-        overheated = False
-
-    # [2] 거시 상승장 (MA5 >= MA200)
-    else:
-        # 이격도 120% 도달 시 과열 플래그 활성화
-        if disp >= 1.20:
-            overheated = True
-
-        if pos == "HOLDING":
-            # 120% 과열 플래그 상태에서 20일선 및 SMC 중심선(Equilibrium) 동시 붕괴 시 조기 익절
-            if overheated and (not above_ma20) and (close < eq):
-                action_title = "🔥 [SMC 과열 조기 익절]"
-                action_desc = "120% 이상 과열 감지 후 20일선 및 SMC 중심선(Eq)이 동시 붕괴되었습니다.\n👉 <b>전량 분할 매도 후 현금화</b>"
-                pos = "CASH_AFTER_EARLY_EXIT"
-                overheated = False
-            else:
-                flag_text = "🔥 ON (과열 주의)" if overheated else "OFF (안정)"
-                action_title = "🔵 [보유 유지 (Ride the Wave)]"
-                action_desc = f"상승 추세가 안정적으로 지속 중입니다.\n👉 <b>포트폴리오 유지 (QLD 60% + TQQQ 40%)</b>\n• 과열 플래그: {flag_text}"
-
-        elif pos in ["CASH_AFTER_BEAR", "CASH_AFTER_EARLY_EXIT"]:
-            # 진입 조건: 20일선 위 + 비과열(이격도 1.16 이하) + MACD 히스토그램 양수 확장
-            cond_trigger = above_ma20 and (disp <= 1.16) and macd_bull
-
-            if cond_trigger:
-                entry_type = "대세 초입 신규 매수" if pos == "CASH_AFTER_BEAR" else "눌림목 재매수"
-                action_title = f"🟢 [{entry_type}]"
-                action_desc = "골든크로스 상태에서 20일선 안착 및 MACD 모멘텀 상승 확인!\n👉 <b>매수 집행: QLD 60% + TQQQ 40%</b>"
-                pos = "HOLDING"
-                overheated = False
-            else:
-                action_title = "⚠️ [진입 타점 대기]"
-                action_desc = "대세 상승장이나 20일선 미돌파, MACD 음수 또는 이격도 과열로 대기 중입니다.\n👉 <b>현금 유지하며 타점 관망</b>"
-
-    new_state = {
-        "position_state": pos,
-        "overheated_flag": overheated,
-        "last_processed_date": data["date"]
-    }
-    return action_title, action_desc, new_state
-
-# ==========================================
-# 4. 메인 실행 루틴
-# ==========================================
 def main():
     state = load_state()
-    data = get_market_data()
 
-    # 중복 실행 방지
-    if state.get("last_processed_date") == data["date"]:
-        print(f"이미 처리된 영업일입니다 ({data['date']}). 프로그램을 종료합니다.")
+    # 지표 산출용 QQQ 데이터 (최근 1년 반 일봉 다운로드)
+    qqq = yf.download("QQQ", period="18mo", interval="1d", progress=False)
+    if qqq.empty:
+        send_telegram("❌ [Macro Gate Alert] QQQ 데이터 다운로드 실패")
         return
 
-    action_title, action_desc, new_state = evaluate_strategy(data, state)
-    save_state(new_state)
+    if isinstance(qqq.columns, pd.MultiIndex):
+        qqq_c = qqq["Close"]["QQQ"]
+        qqq_h = qqq["High"]["QQQ"]
+        qqq_l = qqq["Low"]["QQQ"]
+    else:
+        qqq_c = qqq["Close"]
+        qqq_h = qqq["High"]
+        qqq_l = qqq["Low"]
 
-    msg = (
-        f"📊 <b>Dual-Regime SMC Apex 리포트 ({data['date']})</b>\n\n"
-        f"<b>{action_title}</b>\n"
-        f"{action_desc}\n\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"• <b>QQQ 종가</b>: ${data['qqq_close']:.2f}\n"
-        f"• <b>QLD / TQQQ</b>: ${data['qld_close']:.2f} / ${data['tqqq_close']:.2f}\n"
-        f"• <b>MA5 / MA20 / MA200</b>: ${data['ma5']:.2f} / ${data['ma20']:.2f} / ${data['ma200']:.2f}\n"
-        f"• <b>SMC 중심선 (Eq)</b>: ${data['equilibrium']:.2f}\n"
-        f"• <b>200일선 이격도</b>: {data['disparity']*100:.2f}%\n"
-        f"• <b>MACD Hist</b>: {data['macd_hist']:.3f}\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"• <b>현재 포지션</b>: {new_state['position_state']}\n"
-        f"• <b>과열 플래그</b>: {'🔥 ON' if new_state['overheated_flag'] else 'OFF'}\n"
-    )
+    df = pd.DataFrame(index=qqq_c.index)
+    df["Close"] = qqq_c
+    df["High"] = qqq_h
+    df["Low"] = qqq_l
 
-    print(msg.replace("<b>", "").replace("</b>", ""))
+    # 기술적 지표 계산
+    df["MA5"] = df["Close"].rolling(5).mean()
+    df["MA20"] = df["Close"].rolling(20).mean()
+    df["MA50"] = df["Close"].rolling(50).mean()
+    df["MA200"] = df["Close"].rolling(200).mean()
+    df["Disparity"] = df["Close"] / df["MA200"]
+
+    # 20일 중간값 (Eq)
+    df["Swing_High"] = df["High"].shift(1).rolling(20).max()
+    df["Swing_Low"] = df["Low"].shift(1).rolling(20).min()
+    df["Eq_Val"] = (df["Swing_High"] + df["Swing_Low"]) / 2
+
+    # MACD Histogram
+    ema12 = df["Close"].ewm(span=12, adjust=False).mean()
+    ema26 = df["Close"].ewm(span=26, adjust=False).mean()
+    macd = ema12 - ema26
+    signal = macd.rolling(9).mean()
+    df["MACD_Hist"] = macd - signal
+
+    latest = df.iloc[-1]
+    date_str = latest.name.strftime("%Y-%m-%d")
+
+    close_p = latest["Close"]
+    ma20 = latest["MA20"]
+    ma50 = latest["MA50"]
+    ma200 = latest["MA200"]
+    disp = latest["Disparity"]
+    eq_val = latest["Eq_Val"]
+    macd_hist = latest["MACD_Hist"]
+
+    current_pos = state["position"]
+    cooldown = state["cooldown_counter"]
+    overheated = state["overheated"]
+
+    action = "HOLD"
+    action_reason = ""
+
+    # 1. 과열 체크
+    if disp >= 1.20:
+        overheated = True
+        state["overheated"] = True
+
+    # 2. 포지션 상태별 로직 판정
+    if current_pos == "HOLDING":
+        exit_bear = ma20 < ma200
+        exit_smc = overheated and (close_p <= ma20) and (close_p < eq_val)
+
+        if exit_bear or exit_smc:
+            action = "SELL_ALL"
+            action_reason = "SMC 과열 조기 익절" if exit_smc else "거시 하락 탈출 (MA20 < MA200)"
+            
+            # 수익률 판정 및 쿨다운 세팅
+            pnl = (close_p - state["entry_price"]) / state["entry_price"] * 100
+            if pnl < 0:
+                state["cooldown_counter"] = 15
+            else:
+                state["cooldown_counter"] = 0
+
+            state["position"] = "CASH"
+            state["overheated"] = False
+            state["entry_date"] = None
+            state["entry_price"] = 0.0
+
+    elif current_pos == "CASH":
+        if cooldown > 0:
+            state["cooldown_counter"] -= 1
+
+        is_macro_bull = (ma50 >= ma200) and (close_p >= ma200)
+        is_above_ma20 = close_p > ma20
+        macd_bull = macd_hist > 0
+        cond_entry = (
+            (state["cooldown_counter"] == 0)
+            and is_macro_bull
+            and (ma20 >= ma200)
+            and is_above_ma20
+            and (disp <= 1.16)
+            and macd_bull
+        )
+
+        if cond_entry:
+            action = "BUY_ALL"
+            action_reason = "정배열 안착 및 매크로 게이트 진입 조건 만족"
+            state["position"] = "HOLDING"
+            state["entry_date"] = date_str
+            state["entry_price"] = float(close_p)
+            state["overheated"] = False
+
+    save_state(state)
+
+    # 3. 텔레그램 메시지 생성
+    pnl_str = ""
+    if current_pos == "HOLDING" and state["entry_price"] > 0:
+        cur_pnl = (close_p - state["entry_price"]) / state["entry_price"] * 100
+        pnl_str = f"• 진입일: {state['entry_date']} (QQQ ${state['entry_price']:.2f})\n• 현재 평가손익: *{cur_pnl:+.2f}%*\n"
+
+    status_icon = "🟢" if action == "BUY_ALL" else ("🔴" if action == "SELL_ALL" else "⚪")
+
+    msg = f"""{status_icon} *[Macro Gate 포트폴리오 일일 브리핑]*
+📅 기준일: `{date_str}`
+
+📊 *현재 포지션:* `{current_pos}`
+🎯 *오늘의 주문:* *{action}*
+💡 *사유:* {action_reason if action_reason else "변동 없음 (기존 상태 유지)"}
+{pnl_str}
+📈 *QQQ 주요 지표 현황*
+• 종가: `${close_p:.2f}`
+• 20일선(MA20): `${ma20:.2f}`
+• 50일선(MA50): `${ma50:.2f}`
+• 200일선(MA200): `${ma200:.2f}`
+• 200일선 이격도: `{disp:.3f}` (과열기준: 1.20)
+• MACD Hist: `{macd_hist:+.2f}`
+• 잔여 쿨다운: `{state['cooldown_counter']} 거래일`
+
+📌 *포트폴리오 비중 (매수 시):*
+`QLD 60%` / `TQQQ 40%` (현금 시 SGOV 100%)
+"""
     send_telegram(msg)
+    print(msg)
 
 if __name__ == "__main__":
     main()
