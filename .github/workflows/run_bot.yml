@@ -2,9 +2,11 @@ name: Daily Macro Gate Check
 
 on:
   schedule:
-    # 한국 시간(KST) 매일 오전 07:00 실행 (UTC 22:00)
     - cron: '0 22 * * 1-5'
-  workflow_dispatch: # Actions 탭에서 [Run workflow] 버튼으로 즉시 테스트 가능
+  workflow_dispatch:
+
+permissions:
+  contents: write  # Git Push를 위한 쓰기 권한 부여
 
 jobs:
   build:
