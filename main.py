@@ -1,7 +1,6 @@
 import os
 import json
 import requests
-import datetime
 import yfinance as yf
 import pandas as pd
 
@@ -11,22 +10,36 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 def send_telegram(message: str):
     if not BOT_TOKEN or not CHAT_ID:
-        print("[Warning] Telegram 토큰 또는 Chat ID가 설정되지 않았습니다.")
+        print("[Error] TELEGRAM_BOT_TOKEN 또는 TELEGRAM_CHAT_ID 환경변수가 비어있습니다.")
         return
+
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    # Markdown 대신 문법 충돌이 없는 HTML 모드 사용
     payload = {
         "chat_id": CHAT_ID,
         "text": message,
-        "parse_mode": "Markdown"
+        "parse_mode": "HTML"
     }
-    requests.post(url, json=payload, timeout=10)
+    
+    try:
+        res = requests.post(url, json=payload, timeout=10)
+        res_data = res.json()
+        if not res_data.get("ok"):
+            print(f"[Telegram 전송 실패] HTTP {res.status_code}: {res_data}")
+        else:
+            print("[Telegram 전송 성공]")
+    except Exception as e:
+        print(f"[Telegram 통신 에러]: {e}")
 
 def load_state() -> dict:
     if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
     return {
-        "position": "CASH",           # "CASH" 또는 "HOLDING"
+        "position": "CASH",
         "entry_date": None,
         "entry_price": 0.0,
         "cooldown_counter": 0,
@@ -40,10 +53,10 @@ def save_state(state: dict):
 def main():
     state = load_state()
 
-    # 지표 산출용 QQQ 데이터 (최근 1년 반 일봉 다운로드)
+    print(">> QQQ 데이터 다운로드 중...")
     qqq = yf.download("QQQ", period="18mo", interval="1d", progress=False)
     if qqq.empty:
-        send_telegram("❌ [Macro Gate Alert] QQQ 데이터 다운로드 실패")
+        send_telegram("❌ <b>[Macro Gate]</b> QQQ 데이터 다운로드 실패")
         return
 
     if isinstance(qqq.columns, pd.MultiIndex):
@@ -67,28 +80,27 @@ def main():
     df["MA200"] = df["Close"].rolling(200).mean()
     df["Disparity"] = df["Close"] / df["MA200"]
 
-    # 20일 중간값 (Eq)
     df["Swing_High"] = df["High"].shift(1).rolling(20).max()
     df["Swing_Low"] = df["Low"].shift(1).rolling(20).min()
     df["Eq_Val"] = (df["Swing_High"] + df["Swing_Low"]) / 2
 
-    # MACD Histogram
     ema12 = df["Close"].ewm(span=12, adjust=False).mean()
     ema26 = df["Close"].ewm(span=26, adjust=False).mean()
     macd = ema12 - ema26
     signal = macd.rolling(9).mean()
     df["MACD_Hist"] = macd - signal
 
+    df = df.dropna(subset=["MA200"])
     latest = df.iloc[-1]
     date_str = latest.name.strftime("%Y-%m-%d")
 
-    close_p = latest["Close"]
-    ma20 = latest["MA20"]
-    ma50 = latest["MA50"]
-    ma200 = latest["MA200"]
-    disp = latest["Disparity"]
-    eq_val = latest["Eq_Val"]
-    macd_hist = latest["MACD_Hist"]
+    close_p = float(latest["Close"])
+    ma20 = float(latest["MA20"])
+    ma50 = float(latest["MA50"])
+    ma200 = float(latest["MA200"])
+    disp = float(latest["Disparity"])
+    eq_val = float(latest["Eq_Val"])
+    macd_hist = float(latest["MACD_Hist"])
 
     current_pos = state["position"]
     cooldown = state["cooldown_counter"]
@@ -102,22 +114,17 @@ def main():
         overheated = True
         state["overheated"] = True
 
-    # 2. 포지션 상태별 로직 판정
+    # 2. 포지션별 로직
     if current_pos == "HOLDING":
         exit_bear = ma20 < ma200
         exit_smc = overheated and (close_p <= ma20) and (close_p < eq_val)
 
         if exit_bear or exit_smc:
             action = "SELL_ALL"
-            action_reason = "SMC 과열 조기 익절" if exit_smc else "거시 하락 탈출 (MA20 < MA200)"
+            action_reason = "SMC 과열 조기 익절" if exit_smc else "거시 하락 탈출 (MA20 &lt; MA200)"
             
-            # 수익률 판정 및 쿨다운 세팅
             pnl = (close_p - state["entry_price"]) / state["entry_price"] * 100
-            if pnl < 0:
-                state["cooldown_counter"] = 15
-            else:
-                state["cooldown_counter"] = 0
-
+            state["cooldown_counter"] = 15 if pnl < 0 else 0
             state["position"] = "CASH"
             state["overheated"] = False
             state["entry_date"] = None
@@ -144,40 +151,39 @@ def main():
             action_reason = "정배열 안착 및 매크로 게이트 진입 조건 만족"
             state["position"] = "HOLDING"
             state["entry_date"] = date_str
-            state["entry_price"] = float(close_p)
+            state["entry_price"] = close_p
             state["overheated"] = False
 
     save_state(state)
 
-    # 3. 텔레그램 메시지 생성
+    # 3. 메시지 조립 (HTML 태그 사용)
     pnl_str = ""
     if current_pos == "HOLDING" and state["entry_price"] > 0:
         cur_pnl = (close_p - state["entry_price"]) / state["entry_price"] * 100
-        pnl_str = f"• 진입일: {state['entry_date']} (QQQ ${state['entry_price']:.2f})\n• 현재 평가손익: *{cur_pnl:+.2f}%*\n"
+        pnl_str = f"• 진입일: {state['entry_date']} (QQQ ${state['entry_price']:.2f})\n• 현재 평가손익: <b>{cur_pnl:+.2f}%</b>\n"
 
     status_icon = "🟢" if action == "BUY_ALL" else ("🔴" if action == "SELL_ALL" else "⚪")
 
-    msg = f"""{status_icon} *[Macro Gate 포트폴리오 일일 브리핑]*
-📅 기준일: `{date_str}`
+    msg = f"""{status_icon} <b>[Macro Gate 포트폴리오 일일 브리핑]</b>
+📅 기준일: <code>{date_str}</code>
 
-📊 *현재 포지션:* `{current_pos}`
-🎯 *오늘의 주문:* *{action}*
-💡 *사유:* {action_reason if action_reason else "변동 없음 (기존 상태 유지)"}
+📊 <b>현재 포지션:</b> <code>{current_pos}</code>
+🎯 <b>오늘의 주문:</b> <b>{action}</b>
+💡 <b>사유:</b> {action_reason if action_reason else "변동 없음 (기존 상태 유지)"}
 {pnl_str}
-📈 *QQQ 주요 지표 현황*
-• 종가: `${close_p:.2f}`
-• 20일선(MA20): `${ma20:.2f}`
-• 50일선(MA50): `${ma50:.2f}`
-• 200일선(MA200): `${ma200:.2f}`
-• 200일선 이격도: `{disp:.3f}` (과열기준: 1.20)
-• MACD Hist: `{macd_hist:+.2f}`
-• 잔여 쿨다운: `{state['cooldown_counter']} 거래일`
+📈 <b>QQQ 주요 지표 현황</b>
+• 종가: ${close_p:.2f}
+• 20일선(MA20): ${ma20:.2f}
+• 50일선(MA50): ${ma50:.2f}
+• 200일선(MA200): ${ma200:.2f}
+• 200일선 이격도: {disp:.3f} (과열기준: 1.20)
+• MACD Hist: {macd_hist:+.2f}
+• 잔여 쿨다운: {state['cooldown_counter']} 거래일
 
-📌 *포트폴리오 비중 (매수 시):*
-`QLD 60%` / `TQQQ 40%` (현금 시 SGOV 100%)
+📌 <b>포트폴리오 비중 (매수 시):</b>
+QLD 60% / TQQQ 40% (현금 시 SGOV 100%)
 """
     send_telegram(msg)
-    print(msg)
 
 if __name__ == "__main__":
     main()
