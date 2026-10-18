@@ -14,7 +14,6 @@ def send_telegram(message: str):
         return
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    # Markdown 대신 문법 충돌이 없는 HTML 모드 사용
     payload = {
         "chat_id": CHAT_ID,
         "text": message,
@@ -54,7 +53,15 @@ def main():
     state = load_state()
 
     print(">> QQQ 데이터 다운로드 중...")
-    qqq = yf.download("QQQ", period="18mo", interval="1d", progress=False)
+    # 실제 시장 종가(Unadjusted) 반영 옵션 적용
+    qqq = yf.download(
+        "QQQ", 
+        period="18mo", 
+        interval="1d", 
+        auto_adjust=False, 
+        actions=False, 
+        progress=False
+    )
     if qqq.empty:
         send_telegram("❌ <b>[Macro Gate]</b> QQQ 데이터 다운로드 실패")
         return
@@ -80,10 +87,12 @@ def main():
     df["MA200"] = df["Close"].rolling(200).mean()
     df["Disparity"] = df["Close"] / df["MA200"]
 
+    # 20일 중간값 (Eq)
     df["Swing_High"] = df["High"].shift(1).rolling(20).max()
     df["Swing_Low"] = df["Low"].shift(1).rolling(20).min()
     df["Eq_Val"] = (df["Swing_High"] + df["Swing_Low"]) / 2
 
+    # MACD Histogram
     ema12 = df["Close"].ewm(span=12, adjust=False).mean()
     ema26 = df["Close"].ewm(span=26, adjust=False).mean()
     macd = ema12 - ema26
@@ -109,12 +118,12 @@ def main():
     action = "HOLD"
     action_reason = ""
 
-    # 1. 과열 체크
+    # 1. 과열 체크 (200일선 대비 +20% 이상)
     if disp >= 1.20:
         overheated = True
         state["overheated"] = True
 
-    # 2. 포지션별 로직
+    # 2. 포지션별 로직 판정
     if current_pos == "HOLDING":
         exit_bear = ma20 < ma200
         exit_smc = overheated and (close_p <= ma20) and (close_p < eq_val)
@@ -124,6 +133,7 @@ def main():
             action_reason = "SMC 과열 조기 익절" if exit_smc else "거시 하락 탈출 (MA20 &lt; MA200)"
             
             pnl = (close_p - state["entry_price"]) / state["entry_price"] * 100
+            # 손실 청산 시 15거래일 쿨다운 부여
             state["cooldown_counter"] = 15 if pnl < 0 else 0
             state["position"] = "CASH"
             state["overheated"] = False
@@ -156,7 +166,7 @@ def main():
 
     save_state(state)
 
-    # 3. 메시지 조립 (HTML 태그 사용)
+    # 3. 텔레그램 메시지 생성
     pnl_str = ""
     if current_pos == "HOLDING" and state["entry_price"] > 0:
         cur_pnl = (close_p - state["entry_price"]) / state["entry_price"] * 100
